@@ -682,20 +682,32 @@ local function configure(widget)
     function(v) widget.demoSource = v; widget.latched = 0; widget.lastTimer = nil end)
 end
 
+-- Ethos stores settings by position, so settings saved by an older version
+-- of this widget can land in the wrong slot. Keep only values of the
+-- right type; anything else falls back to the default.
+local function asSource(v)
+  if type(v) == "userdata" or type(v) == "table" then return v end
+  return nil
+end
+local function asInt(v, def, lo, hi)
+  if type(v) == "number" and v == math.floor(v) and v >= lo and v <= hi then return v end
+  return def
+end
+
 local function read(widget)
-  widget.battSource  = storage.read("battSrc")
-  widget.battCells   = storage.read("battCells") or 0
-  widget.rxSource    = storage.read("rxSrc")
-  widget.rxType      = storage.read("rxType") or 1
-  widget.rxCells     = storage.read("rxCells") or 2
-  widget.timerSource = storage.read("timerSrc")
-  widget.armSwitch   = storage.read("armSw")
+  widget.battSource  = asSource(storage.read("battSrc"))
+  widget.battCells   = asInt(storage.read("battCells"), 0, 0, MAX_CELLS)
+  widget.rxSource    = asSource(storage.read("rxSrc"))
+  widget.rxType      = asInt(storage.read("rxType"), 1, 1, #BATT_TYPES)
+  widget.rxCells     = asInt(storage.read("rxCells"), 2, 1, 12)
+  widget.timerSource = asSource(storage.read("timerSrc"))
+  widget.armSwitch   = asSource(storage.read("armSw"))
   widget.rateSwitches = {
-    storage.read("rateLow"),
-    storage.read("rateMed"),
-    storage.read("rateHigh"),
+    asSource(storage.read("rateLow")),
+    asSource(storage.read("rateMed")),
+    asSource(storage.read("rateHigh")),
   }
-  widget.demoSource  = storage.read("demo")
+  widget.demoSource  = asSource(storage.read("demo"))
 end
 
 local function write(widget)

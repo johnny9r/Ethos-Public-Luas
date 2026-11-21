@@ -14,9 +14,10 @@
 --   +----------------------+  |        .-~~~~~~~-.
 --   RATES [LOW][MED][HIGH]    |      /    8.0V     \
 --
--- Image:          any image file on the SD card (e.g. /bitmaps/models/x.png).
---                 Leave the setting blank to use the model's own image.
---                 Scaled to fit the left panel, keeping its proportions.
+-- Image:          either the model's own image, or a picture chosen with the
+--                 Ethos file picker from /bitmaps/models (the same folder
+--                 the standard Bitmap widget uses). Scaled to fit the left
+--                 panel, keeping its proportions.
 -- Timer:          any Ethos timer, shown as MM:SS. Ring and digits turn red
 --                 in the last minute and when the timer runs past zero.
 -- Engine:         green ARMED / red DISARMED from a logical or physical switch.
@@ -43,6 +44,13 @@
 -- Settings you may want to tweak
 ------------------------------------------------------------------------
 local TIMER_WARN = 60        -- seconds left when the timer turns red
+
+-- Folder the picture picker browses (same as the standard Bitmap widget).
+local IMAGE_DIR = "/bitmaps/models"
+
+-- Image setting
+local IMG_MODEL = 0          -- use the model's own image
+local IMG_FILE  = 1          -- use the picture chosen from IMAGE_DIR
 
 -- Per-cell voltages for each battery type: empty = left end of the dial,
 -- full = right end, >= green is green, >= yellow is yellow, below is red.
@@ -167,12 +175,61 @@ end
 ------------------------------------------------------------------------
 -- Image
 ------------------------------------------------------------------------
--- The path to show: the setting, or the model's own image when blank.
+-- Full path for a picked file. The picker may hand back just the file name
+-- or a full path depending on Ethos version, so accept both.
+local function filePath(f)
+  if f == nil or f == "" then return nil end
+  if string.find(f, "/", 1, true) or string.find(f, ":", 1, true) then return f end
+  return IMAGE_DIR .. "/" .. f
+end
+
+-- The path to show: the picked picture, or the model's own image.
 local function imagePath(widget)
-  local p = widget.imageFile
-  if p ~= nil and p ~= "" then return p end
+  if widget.imageMode == IMG_FILE then
+    return filePath(widget.imageFile)
+  end
   local ok, mp = pcall(function() return model.bitmap() end)
   if ok and type(mp) == "string" and mp ~= "" then return mp end
+  return nil
+end
+
+-- Ethos pickers often hand back the name without its extension, and the
+-- radio and simulator differ on leading slashes, so try the likely spellings.
+-- Real extensions first: Ethos can hand back an empty bitmap for a path
+-- that doesn't exist, so the bare name is only a last resort.
+local IMAGE_EXTS = { ".png", ".bmp", ".jpg", "" }
+
+local function hasExt(p)
+  return string.match(p, "%.[%a%d]+$") ~= nil
+end
+
+-- A loaded bitmap counts only if it has a real size (when Ethos can tell us).
+local function tryLoad(p)
+  local ok, bmp = pcall(function() return lcd.loadBitmap(p) end)
+  if not (ok and bmp) then return nil end
+  local okW, bw = pcall(function() return bmp:width() end)
+  if okW and type(bw) == "number" and bw <= 0 then return nil end
+  return bmp
+end
+
+local function loadImage(path)
+  local bases = { path }
+  if string.sub(path, 1, 1) == "/" then
+    bases[#bases + 1] = string.sub(path, 2)
+  elseif not string.find(path, ":", 1, true) then
+    bases[#bases + 1] = "/" .. path
+  end
+  for _, base in ipairs(bases) do
+    if hasExt(base) then
+      local bmp = tryLoad(base)
+      if bmp then return bmp, base end
+    else
+      for _, ext in ipairs(IMAGE_EXTS) do
+        local bmp = tryLoad(base .. ext)
+        if bmp then return bmp, base .. ext end
+      end
+    end
+  end
   return nil
 end
 
@@ -182,10 +239,7 @@ local function getBitmap(widget)
   if path ~= widget.bmpPath then
     widget.bmpPath = path
     widget.bmp = nil
-    if path then
-      local ok, bmp = pcall(function() return lcd.loadBitmap(path) end)
-      if ok then widget.bmp = bmp end
-    end
+    if path then widget.bmp = loadImage(path) end
   end
   return widget.bmp
 end
@@ -311,7 +365,8 @@ end
 local function create()
   return {
     -- settings
-    imageFile = "",       -- blank = model image
+    imageMode = IMG_MODEL,
+    imageFile = "",       -- picture picked from IMAGE_DIR
     rxSource = nil,
     rxType = 1,           -- index into BATT_TYPES
     rxCells = 2,
@@ -424,10 +479,17 @@ local function paintImage(widget, L)
     -- Scale to fit, keeping proportions, centred in the panel.
     local ok = pcall(function()
       local bw, bh = bmp:width(), bmp:height()
+      if type(bw) ~= "number" or type(bh) ~= "number" or bw <= 0 or bh <= 0 then
+        error("no size")
+      end
       local s = math.min(w / bw, h / bh)
       local dw, dh = math.floor(bw * s), math.floor(bh * s)
       lcd.drawBitmap(math.floor(x + (w - dw) / 2), math.floor(y + (h - dh) / 2), bmp, dw, dh)
     end)
+    if not ok then
+      -- Size unknown on this firmware: stretch to the panel instead.
+      ok = pcall(function() lcd.drawBitmap(x, y, bmp, w, h) end)
+    end
     drawn = ok
   end
 
@@ -436,9 +498,26 @@ local function paintImage(widget, L)
     lcd.drawFilledRectangle(x, y, w, h)
     lcd.font(FONT_S)
     lcd.color(C_DIMTEXT)
-    local msg = imagePath(widget) and "Image not found" or "Set image"
+    local msg
+    local path = imagePath(widget)
+    if path then msg = "Image not found"
+    elseif widget.imageMode == IMG_FILE then msg = "Pick a picture"
+    else msg = "Model has no image" end
     local tw, th = lcd.getTextSize(msg)
     lcd.drawText(math.floor(x + (w - tw) / 2), math.floor(y + (h - th) / 2), msg)
+    -- Show what was tried, and what the picker handed back, so a wrong
+    -- path is easy to spot.
+    local lines = {}
+    if path then lines[#lines + 1] = path end
+    if widget.imageMode == IMG_FILE then
+      lines[#lines + 1] = "picker: '" .. tostring(widget.imageFile) .. "'"
+    end
+    local ly = math.floor(y + (h + th) / 2 + 4)
+    for _, s in ipairs(lines) do
+      local pw = lcd.getTextSize(s)
+      lcd.drawText(math.floor(x + math.max(0, (w - pw) / 2)), ly, s)
+      ly = ly + th + 2
+    end
   end
 
   if widget.demo then
@@ -586,11 +665,40 @@ local RX_CELL_CHOICES = {
   { "1S", 1 }, { "2S", 2 }, { "3S", 3 }, { "4S", 4 }, { "5S", 5 },
 }
 
+local IMAGE_CHOICES = {
+  { "Model image", IMG_MODEL },
+  { "Picture from " .. IMAGE_DIR, IMG_FILE },
+}
+
 local function configure(widget)
-  local line = form.addLine("Image file (blank = model image)")
-  form.addTextField(line, nil,
-    function() return widget.imageFile end,
-    function(v) widget.imageFile = v or ""; lcd.invalidate() end)
+  local pictureField = nil
+  local function updatePictureField()
+    if pictureField then
+      pcall(function() pictureField:enable(widget.imageMode == IMG_FILE) end)
+    end
+  end
+
+  local line = form.addLine("Image")
+  form.addChoiceField(line, nil, IMAGE_CHOICES,
+    function() return widget.imageMode end,
+    function(v) widget.imageMode = v; updatePictureField(); lcd.invalidate() end)
+
+  -- Ethos file picker listing the pictures in IMAGE_DIR, like the standard
+  -- Bitmap widget. Falls back to a text box on firmware without the picker.
+  line = form.addLine("Picture")
+  local ok, field = pcall(function()
+    return form.addFileField(line, nil, IMAGE_DIR, "image",
+      function() return widget.imageFile end,
+      function(v) widget.imageFile = v or ""; lcd.invalidate() end)
+  end)
+  if ok and field then
+    pictureField = field
+  else
+    pictureField = form.addTextField(line, nil,
+      function() return widget.imageFile end,
+      function(v) widget.imageFile = v or ""; lcd.invalidate() end)
+  end
+  updatePictureField()
 
   line = form.addLine("Receiver voltage")
   form.addSourceField(line, nil,
@@ -631,23 +739,43 @@ local function configure(widget)
     function(v) widget.demoSource = v; widget.lastTimer = nil end)
 end
 
+-- Ethos stores settings by position, so settings saved by an older version
+-- of this widget can land in the wrong slot. Keep only values of the
+-- right type; anything else falls back to the default.
+local function asSource(v)
+  if type(v) == "userdata" or type(v) == "table" then return v end
+  return nil
+end
+local function asString(v, def)
+  if type(v) == "string" then return v end
+  return def
+end
+local function asInt(v, def, lo, hi)
+  if type(v) == "number" and v == math.floor(v) and v >= lo and v <= hi then return v end
+  return def
+end
+
 local function read(widget)
-  widget.imageFile   = storage.read("image") or ""
-  widget.rxSource    = storage.read("rxSrc")
-  widget.rxType      = storage.read("rxType") or 1
-  widget.rxCells     = storage.read("rxCells") or 2
-  widget.timerSource = storage.read("timerSrc")
-  widget.armSwitch   = storage.read("armSw")
+  widget.imageFile   = asString(storage.read("image"), "")
+  -- Older versions had no mode: a typed-in file name meant "use that file".
+  widget.imageMode   = asInt(storage.read("imgMode"), nil, IMG_MODEL, IMG_FILE)
+    or ((widget.imageFile ~= "") and IMG_FILE or IMG_MODEL)
+  widget.rxSource    = asSource(storage.read("rxSrc"))
+  widget.rxType      = asInt(storage.read("rxType"), 1, 1, #BATT_TYPES)
+  widget.rxCells     = asInt(storage.read("rxCells"), 2, 1, 12)
+  widget.timerSource = asSource(storage.read("timerSrc"))
+  widget.armSwitch   = asSource(storage.read("armSw"))
   widget.rateSwitches = {
-    storage.read("rateLow"),
-    storage.read("rateMed"),
-    storage.read("rateHigh"),
+    asSource(storage.read("rateLow")),
+    asSource(storage.read("rateMed")),
+    asSource(storage.read("rateHigh")),
   }
-  widget.demoSource  = storage.read("demo")
+  widget.demoSource  = asSource(storage.read("demo"))
 end
 
 local function write(widget)
   storage.write("image", widget.imageFile)
+  storage.write("imgMode", widget.imageMode)
   storage.write("rxSrc", widget.rxSource)
   storage.write("rxType", widget.rxType)
   storage.write("rxCells", widget.rxCells)

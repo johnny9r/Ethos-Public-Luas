@@ -15,11 +15,14 @@
 -- Timer:          any Ethos timer, shown as MM:SS. Ring and digits turn red
 --                 in the last minute and when the timer runs past zero.
 -- Engine:         green ARMED / red DISARMED from a logical or physical switch.
--- Receiver:       half dial from a telemetry voltage, with configurable
---                 battery type and cell count.
+-- Receiver:       half dial from a telemetry voltage, with a pack preset
+--                 (6.0 / 7.2 / 8.4 V) and adjustable colour bands.
 -- Rates:          LOW / MED / HIGH from a 3-position switch. Each rate gets
 --                 its own switch-position setting (e.g. SA-up / SA-mid /
 --                 SA-down), so Ethos reports the active position directly.
+-- Trims:          edge bars for the four stick trims (Mode 2: throttle left,
+--                 elevator right, rudder and aileron along the bottom).
+--                 Found automatically; can be changed or hidden in settings.
 --
 -- Demo mode (for bench testing): pick a pot or slider as "Demo source".
 --   * Flight and receiver battery voltages always follow the pot. With fixed
@@ -49,6 +52,17 @@ local BATT_TYPES = {
   { name = "Li-Ion", empty = 3.30, full = 4.20, yellow = 3.60, green = 3.90 },
   { name = "NiMH",   empty = 1.10, full = 1.40, yellow = 1.20, green = 1.25 },
 }
+
+-- Receiver pack presets (volts). Dial runs from empty (left) to full
+-- (right); green from `green`, yellow from `yellow`, red below that.
+-- Picking a preset fills these in; each can then be adjusted in settings.
+local RX_PRESETS = {
+  { name = "6.0V", empty = 5.00, yellow = 5.40, green = 5.70, full = 6.00 },
+  { name = "7.2V", empty = 6.00, yellow = 6.30, green = 6.50, full = 7.20 },
+  { name = "8.4V", empty = 6.50, yellow = 6.70, green = 7.00, full = 8.40 },
+}
+local RX_DEFAULT_PRESET = 3
+
 local FLIGHT_TYPE = BATT_TYPES[1]   -- flight pack is LiPo
 
 -- Flight pack auto-detect, 1S to MAX_CELLS. When telemetry first appears the
@@ -116,6 +130,18 @@ local function zoneColor(cell, bt)
   if cell >= bt.green then return C_GREEN
   elseif cell >= bt.yellow then return C_YELLOW end
   return C_RED
+end
+
+-- The receiver's dial ranges in volts, shaped like a battery type with one
+-- "cell". Falls back to the preset if the adjusted values are out of order.
+local function rxProfile(widget)
+  local p = { empty = widget.rxEmpty, yellow = widget.rxYellow,
+              green = widget.rxGreen, full = widget.rxFull }
+  if not (p.empty and p.yellow and p.green and p.full)
+     or not (p.empty <= p.yellow and p.yellow <= p.green and p.green < p.full) then
+    p = RX_PRESETS[widget.rxPreset] or RX_PRESETS[RX_DEFAULT_PRESET]
+  end
+  return p
 end
 
 local function detectCells(volts)
@@ -202,53 +228,248 @@ local function dialAngle(d, f)
   return d.a0 + f * (d.a1 - d.a0)
 end
 
--- One pass over the segments: filled part in fillColor up to fillA, the rest
--- in the dim zone colour (aY/aG = yellow/green start angles), or in the
--- plain track colour when aY is nil.
-local function drawDial(d, fillA, fillColor, aY, aG)
+-- Dial style: a dark track, a fill that fades red -> yellow -> green along
+-- the scale, rounded ends, a white dot at the tip, and a scale of ticks
+-- inside the arc.
+local RGB_RED, RGB_YELLOW, RGB_GREEN = { 220, 30, 30 }, { 240, 200, 0 }, { 0, 200, 60 }
+local C_TICK = lcd.RGB(90, 98, 108)
+local TICK_FONT = FONT_XS or FONT_S
+
+local function mixRGB(a, b, t)
+  t = clamp01(t)
+  return lcd.RGB(math.floor(a[1] + (b[1] - a[1]) * t + 0.5),
+                 math.floor(a[2] + (b[2] - a[2]) * t + 0.5),
+                 math.floor(a[3] + (b[3] - a[3]) * t + 0.5))
+end
+
+-- Colour of every segment: red at the empty end, yellow where the yellow
+-- band starts (fY) and green from where the green band starts (fG).
+-- Cached on the dial until the bands change.
+local function gradientColors(d, fY, fG)
+  local key = string.format("%.3f|%.3f", fY, fG)
+  if d.gradKey == key then return d.grad end
+  local cols = {}
+  for i = 0, d.n - 1 do
+    local f = (d.mid[i] - d.a0) / (d.a1 - d.a0)
+    if f < fY and fY > 0 then
+      cols[i] = mixRGB(RGB_RED, RGB_YELLOW, f / fY)
+    elseif f < fG and fG > fY then
+      cols[i] = mixRGB(RGB_YELLOW, RGB_GREEN, (f - fY) / (fG - fY))
+    else
+      cols[i] = mixRGB(RGB_GREEN, RGB_GREEN, 0)
+    end
+  end
+  d.grad, d.gradKey = cols, key
+  return d.grad
+end
+
+-- Track plus fill up to frac (0..1, nil = no reading). The fill uses the
+-- per-segment colours in cols, or one solid colour.
+local function drawSweep(d, frac, cols, solid)
   local xi, yi, xo, yo, mid = d.xi, d.yi, d.xo, d.yo, d.mid
+  local fillA = frac and dialAngle(d, clamp01(frac)) or nil
   local cur = nil
   for i = 0, d.n - 1 do
-    local m = mid[i]
-    local c
-    if fillA and m <= fillA then c = fillColor
-    elseif aY == nil then c = C_TRACK
-    elseif m < aY then c = C_RED_DIM
-    elseif m < aG then c = C_YELLOW_DIM
-    else c = C_GREEN_DIM end
+    local c = C_TILE
+    if fillA and mid[i] <= fillA then c = solid or cols[i] end
     if c ~= cur then lcd.color(c); cur = c end
     local j = i + 1
     lcd.drawFilledTriangle(xi[i], yi[i], xo[i], yo[i], xo[j], yo[j])
     lcd.drawFilledTriangle(xi[i], yi[i], xo[j], yo[j], xi[j], yi[j])
   end
+
+  local rm = (d.r1 + d.r2) / 2
+  local cap = math.max(2, math.floor((d.r2 - d.r1) / 2))
+  if d.a1 - d.a0 < 360 then
+    -- Rounded ends of the track.
+    local sx, sy = polar(d.cx, d.cy, rm, d.a0)
+    lcd.color((fillA and fillA > d.a0) and (solid or cols[0]) or C_TILE)
+    lcd.drawFilledCircle(sx, sy, cap)
+    local ex, ey = polar(d.cx, d.cy, rm, d.a1)
+    lcd.color((fillA and fillA >= d.a1) and (solid or cols[d.n - 1]) or C_TILE)
+    lcd.drawFilledCircle(ex, ey, cap)
+  end
+  if fillA then
+    local tx, ty = polar(d.cx, d.cy, rm, fillA)
+    lcd.color(C_TEXT)
+    lcd.drawFilledCircle(tx, ty, cap + 3)
+  end
 end
 
--- Small white marker across the band at angle a.
-local function drawMarker(d, a)
-  local a0 = math.max(d.a0, a - 2)
-  local a1 = math.min(d.a1, a + 2)
-  local x1, y1 = polar(d.cx, d.cy, d.r1 - 3, a0)
-  local x2, y2 = polar(d.cx, d.cy, d.r2 + 3, a0)
-  local x3, y3 = polar(d.cx, d.cy, d.r2 + 3, a1)
-  local x4, y4 = polar(d.cx, d.cy, d.r1 - 3, a1)
+-- Scale inside the arc: scale.n intervals, a labelled major tick every
+-- scale.major ticks. Positions are cached on the dial per scale.key.
+local function drawTicks(d, scale)
+  if d.tickKey ~= scale.key then
+    local t = {}
+    local rin = d.r1 - 3
+    local big = math.max(5, math.floor(d.r2 * 0.08))
+    lcd.font(TICK_FONT)
+    for k = 0, scale.n do
+      local f = k / scale.n
+      local a = dialAngle(d, f)
+      local major = (k % scale.major == 0)
+      local len = major and big or math.floor(big / 2)
+      local x0, y0 = polar(d.cx, d.cy, rin - len, a)
+      local x1, y1 = polar(d.cx, d.cy, rin, a)
+      local e = { x0, y0, x1, y1, major }
+      if major then
+        local txt = scale.label(f)
+        local tw, th = lcd.getTextSize(txt)
+        local lx, ly = polar(d.cx, d.cy, rin - big - 3 - math.max(tw, th) / 2, a)
+        e.txt, e.lx, e.ly = txt, math.floor(lx - tw / 2), math.floor(ly - th / 2)
+      end
+      t[#t + 1] = e
+    end
+    d.ticks, d.tickKey = t, scale.key
+  end
+  lcd.font(TICK_FONT)
+  for _, e in ipairs(d.ticks) do
+    lcd.color(e[5] and C_SUBTEXT or C_TICK)
+    lcd.drawLine(e[1], e[2], e[3], e[4])
+    if e.txt then
+      lcd.color(C_SUBTEXT)
+      lcd.drawText(e.lx, e.ly, e.txt)
+    end
+  end
+end
+
+-- Battery dial: gradient fill to the reading plus its scale.
+-- cell = per-cell volts (or volts for a one-"cell" profile), nil = none.
+local function drawZoneDial(d, bt, cell, scale)
+  local fY, fG = cellFrac(bt.yellow, bt), cellFrac(bt.green, bt)
+  drawSweep(d, cell and cellFrac(cell, bt) or nil, gradientColors(d, fY, fG), nil)
+  if scale then drawTicks(d, scale) end
+end
+
+-- Receiver scale: a tick every 0.1 V, labelled every 0.5 V.
+local function rxScale(bt)
+  local n = math.max(4, math.min(40, math.floor((bt.full - bt.empty) / 0.1 + 0.5)))
+  return { key = string.format("rx%.2f|%.2f", bt.empty, bt.full), n = n, major = 5,
+           label = function(f)
+             return string.format("%.1f", bt.empty + f * (bt.full - bt.empty))
+           end }
+end
+
+------------------------------------------------------------------------
+-- Trims: edge bars like the Ethos home screen (Mode 2 layout):
+-- throttle on the left edge, elevator on the right edge, rudder along the
+-- bottom-left and aileron along the bottom-right. The marker turns green
+-- when a trim is centred.
+------------------------------------------------------------------------
+local TRIM_RUD, TRIM_ELE, TRIM_THR, TRIM_AIL = 1, 2, 3, 4
+local TRIM_NAMES = { "Rudder", "Elevator", "Throttle", "Aileron" }
+local TRIM_KEYS  = { "rud", "ele", "thr", "ail" }
+local C_TRIM_TICK = lcd.RGB(90, 98, 108)
+
+-- Find the four stick trims. Matches them by name when Ethos names them
+-- that way; otherwise assumes T1..T4 = rudder, elevator, throttle, aileron.
+-- Any of them can be changed in the widget settings.
+local function findTrims()
+  local found, byOrder, named = {}, {}, false
+  if CATEGORY_TRIM == nil then return found end
+  for m = 0, 3 do
+    local ok, src = pcall(function()
+      return system.getSource({ category = CATEGORY_TRIM, member = m })
+    end)
+    if ok and src then
+      byOrder[m + 1] = src
+      local okN, n = pcall(function() return src:name() end)
+      n = (okN and type(n) == "string") and string.lower(n) or ""
+      for i, k in ipairs(TRIM_KEYS) do
+        if found[i] == nil and string.find(n, k, 1, true) then
+          found[i] = src
+          named = true
+        end
+      end
+    end
+  end
+  if not named then return byOrder end
+  return found
+end
+
+-- Trim position as 0..1 (0.5 = centre), whether it is centred, and the
+-- number to show (as Ethos shows it, e.g. "+4" or "-114").
+-- Uses the source's own range when Ethos provides it, else +/-1024.
+local function trimFrac(src)
+  if src == nil then return nil, false, nil end
+  local ok, v = pcall(function() return src:value() end)
+  if not ok or type(v) ~= "number" then return nil, false, nil end
+  local scale = 1024
+  local okM, mx = pcall(function() return src:maximum() end)
+  if okM and type(mx) == "number" and mx > 0 then scale = mx end
+
+  local label = nil
+  local okS, sv = pcall(function() return src:stringValue() end)
+  if okS and type(sv) == "string" and sv ~= "" then
+    label = sv
+  else
+    label = string.format("%d", math.floor(v + 0.5))
+  end
+  if string.match(label, "^%d") and string.match(label, "[1-9]") then
+    label = "+" .. label
+  end
+  return clamp01((v / scale + 1) / 2), math.abs(v) < 0.5, label
+end
+
+local TRIM_FONT = FONT_XS or FONT_S
+
+-- One trim bar: thin track, centre tick, a square marker and the trim
+-- number beside it. Vertical bars put positive trim at the top; their
+-- number sits above or below the marker, whichever side has more room.
+local function drawTrimBar(x, y, len, t, frac, centred, label, vertical)
+  local trackT = math.max(2, math.floor(t * 0.3))
+  local off = math.floor((t - trackT) / 2)
+  local mid = math.floor(len / 2)
+  lcd.color(C_TRACK)
+  if vertical then
+    lcd.drawFilledRectangle(x + off, y, trackT, len)
+    lcd.color(C_TRIM_TICK)
+    lcd.drawFilledRectangle(x, y + mid - 1, t, 2)
+  else
+    lcd.drawFilledRectangle(x, y + off, len, trackT)
+    lcd.color(C_TRIM_TICK)
+    lcd.drawFilledRectangle(x + mid - 1, y, 2, t)
+  end
+  if frac == nil then return end
+
+  local p = math.floor(frac * (len - t) + 0.5)
+  local mx, my
+  if vertical then mx, my = x, y + (len - t) - p else mx, my = x + p, y end
+  lcd.color(centred and C_GREEN or C_TEXT)
+  lcd.drawFilledRectangle(mx, my, t, t)
+
+  -- A centred trim is shown by the green marker, so no number then.
+  if label == nil or centred then return end
+  lcd.font(TRIM_FONT)
+  local tw, th = lcd.getTextSize(label)
+  local tx, ty
+  if vertical then
+    tx = (x == 0) and 0 or (x + t - tw)   -- flush with the screen edge
+    ty = (frac > 0.5) and (my + t + 3) or (my - th - 3)
+  else
+    -- Put the number on whichever side of the marker has more room.
+    tx = (frac > 0.5) and (mx - tw - 4) or (mx + t + 4)
+    ty = y + math.floor((t - th) / 2)
+  end
+  lcd.color(C_BG)
+  lcd.drawFilledRectangle(tx - 2, ty, tw + 4, th)
   lcd.color(C_TEXT)
-  lcd.drawFilledTriangle(x1, y1, x2, y2, x3, y3)
-  lcd.drawFilledTriangle(x1, y1, x3, y3, x4, y4)
+  lcd.drawText(tx, ty, label)
 end
 
--- Zoned battery dial with fill and marker. cell = per-cell volts or nil.
-local function drawZoneDial(d, bt, cell, color)
-  local aY = dialAngle(d, cellFrac(bt.yellow, bt))
-  local aG = dialAngle(d, cellFrac(bt.green, bt))
-  local fillA = cell and dialAngle(d, cellFrac(cell, bt)) or nil
-  drawDial(d, fillA, color, aY, aG)
-  if fillA then drawMarker(d, fillA) end
+local function paintTrims(widget, L)
+  if not L.trims then return end
+  local f, c, s, t = widget.trimFrac, widget.trimCentred, widget.trimLabel, L.tb
+  drawTrimBar(L.tLeftX,  L.tVy, L.tVlen,   t, f[TRIM_THR], c[TRIM_THR], s[TRIM_THR], true)
+  drawTrimBar(L.tRightX, L.tVy, L.tVlen,   t, f[TRIM_ELE], c[TRIM_ELE], s[TRIM_ELE], true)
+  drawTrimBar(L.tRudX,   L.tHy, L.tRudLen, t, f[TRIM_RUD], c[TRIM_RUD], s[TRIM_RUD], false)
+  drawTrimBar(L.tAilX,   L.tHy, L.tAilLen, t, f[TRIM_AIL], c[TRIM_AIL], s[TRIM_AIL], false)
 end
 
 ------------------------------------------------------------------------
 -- Layout (computed once per widget size)
 ------------------------------------------------------------------------
-local function buildLayout(w, h)
+local function buildLayout(w, h, trims)
   local L = { w = w, h = h }
   local pad = math.max(4, math.floor(h * 0.03))
   L.pad = pad
@@ -256,45 +477,69 @@ local function buildLayout(w, h)
   local _, lh = lcd.getTextSize("Ag")
   L.lh = lh
 
+  -- Trim bars take a strip on the left, right and bottom edges.
+  L.trims = trims
+  local ox, cw, ch = 0, w, h
+  if trims then
+    local t = math.max(8, math.floor(h * 0.045))
+    L.tb = t
+    -- Side strips only hold the bars; the side numbers sit above or below
+    -- their markers, lined up with the screen edge.
+    ox = t + 3
+    cw = w - 2 * ox
+    ch = h - t - 3
+  end
+  L.ch = ch
+
   -- Columns: left half for flight battery + rates, right half for the rest.
-  local split = math.floor(w * 0.5)
+  local split = ox + math.floor(cw * 0.5)
   L.split = split
-  L.lx = pad
+  L.lx = ox + pad
   L.lw = split - pad - math.floor(pad / 2)
   L.rx = split + math.floor(pad / 2) + 1
-  L.rw = w - L.rx - pad
+  L.rw = ox + cw - L.rx - pad
 
   -- Left: flight dial above the rates strip.
-  L.ratesH = math.max(24, math.floor(h * 0.12))
-  L.ratesY = h - pad - L.ratesH
+  L.ratesH = math.max(24, math.floor(ch * 0.12))
+  L.ratesY = ch - pad - L.ratesH
   local fTop = pad + lh + 2
   local fH = L.ratesY - pad - fTop
   local r = math.max(16, math.floor(math.min(L.lw / 2, fH / 1.5)))
-  local band = math.max(6, math.floor(r * 0.2))
+  local band = math.max(5, math.floor(r * 0.14))
   local cx = math.floor(L.lx + L.lw / 2)
   local cy = math.floor(fTop + (fH - 1.5 * r) / 2 + r)
   L.flight = makeDial(cx, cy, r - band, r, -120, 120)
 
-  -- Right top: timer ring + engine badge.
-  L.rowH = math.floor((h - 2 * pad) * 0.44)
-  local ringD = math.min(L.rowH, math.floor(L.rw * 0.55))
-  local ringR = math.max(12, math.floor(ringD / 2))
+  -- Right top: timer ring and engine light as two equal circles, each with
+  -- its name underneath (same size as the circles on the Gas Flight Dash).
+  L.rowH = math.floor((ch - 2 * pad) * 0.44)
+  local ringR = math.max(12, math.floor(math.min((L.rw / 3 - pad) / 2, (L.rowH - lh - 3) / 2)))
   local rBand = math.max(5, math.floor(ringR * 0.13))
-  L.ring = makeDial(L.rx + ringR, pad + math.floor(L.rowH / 2), ringR - rBand, ringR, 0, 360)
-  L.engX = L.rx + ringD + pad
-  L.engW = L.rx + L.rw - L.engX
+  L.circR = ringR
+  L.circY = math.floor(pad + (L.rowH - (2 * ringR + 3 + lh)) / 2 + ringR)
+  L.ring = makeDial(math.floor(L.rx + L.rw * 0.25), L.circY, ringR - rBand, ringR, 0, 360)
+  L.engCx = math.floor(L.rx + L.rw * 0.75)
 
   -- Right bottom: receiver half dial.
   L.rxDivY = pad + L.rowH + pad
   L.rxY = L.rxDivY + math.floor(pad / 2) + 1
-  local rxH = h - L.rxY - pad
+  local rxH = ch - L.rxY - pad
   local top = L.rxY + lh + 4
   local availH = rxH - lh - 4
   local rr = math.max(16, math.floor(math.min(L.rw / 2, availH)))
-  local rrBand = math.max(6, math.floor(rr * 0.2))
+  local rrBand = math.max(5, math.floor(rr * 0.14))
   local rcx = math.floor(L.rx + L.rw / 2)
   local rcy = math.floor(top + (availH - rr) / 2 + rr)
   L.rxDial = makeDial(rcx, rcy, rr - rrBand, rr, -90, 90)
+
+  if trims then
+    local t = L.tb
+    L.tLeftX, L.tRightX = 0, w - t
+    L.tVy, L.tVlen = pad, ch - 2 * pad
+    L.tHy = h - t
+    L.tRudX, L.tRudLen = L.lx, L.lw
+    L.tAilX, L.tAilLen = L.rx, L.rw
+  end
 
   return L
 end
@@ -308,8 +553,11 @@ local function create()
     battSource = nil,
     battCells = 0,        -- 0 = Auto
     rxSource = nil,
-    rxType = 1,           -- index into BATT_TYPES
-    rxCells = 2,
+    rxPreset = RX_DEFAULT_PRESET,  -- index into RX_PRESETS
+    rxEmpty  = RX_PRESETS[RX_DEFAULT_PRESET].empty,
+    rxYellow = RX_PRESETS[RX_DEFAULT_PRESET].yellow,
+    rxGreen  = RX_PRESETS[RX_DEFAULT_PRESET].green,
+    rxFull   = RX_PRESETS[RX_DEFAULT_PRESET].full,
     timerSource = nil,
     armSwitch = nil,
     rateSwitches = {},    -- [1]=LOW, [2]=MED, [3]=HIGH switch positions
@@ -322,6 +570,9 @@ local function create()
     rate = nil,
     demo = false,
     lastKey = nil,
+    trimShow = 1,         -- 1 = show the trim edge bars
+    trimSources = findTrims(),
+    trimFrac = {}, trimCentred = {}, trimLabel = {},
     layout = nil,
   }
 end
@@ -333,8 +584,7 @@ local function wakeup(widget)
     local p = widget.demoSource:value()
     if p then demoT = potToFrac(p) end
   end
-  local rxBt = BATT_TYPES[widget.rxType] or BATT_TYPES[1]
-  local rxCells = math.max(1, widget.rxCells)
+  local rxBt = rxProfile(widget)
 
   -- A pot/slider picked directly as a voltage source drives that dial like
   -- demo mode (raw -1024..1024 would otherwise show as hundreds of volts).
@@ -394,7 +644,7 @@ local function wakeup(widget)
     -- Sweep a little past each end of the receiver dial.
     local lo = rxBt.empty - 0.10 * (rxBt.full - rxBt.empty)
     local hi = rxBt.full + 0.05 * (rxBt.full - rxBt.empty)
-    rv = rxCells * (lo + (hi - lo) * rxT)
+    rv = lo + (hi - lo) * rxT
   else
     rv = rxRaw
   end
@@ -446,6 +696,16 @@ local function wakeup(widget)
     widget.rxVolts and string.format("%.2f", widget.rxVolts) or "-",
     tostring(widget.timerSecs), tostring(widget.timerMax),
     tostring(widget.armed), tostring(widget.rate))
+  -- Trims
+  local trimKey = ""
+  if widget.trimShow == 1 then
+    for i = 1, 4 do
+      local fr, ctr, lbl = trimFrac(widget.trimSources[i])
+      widget.trimFrac[i], widget.trimCentred[i], widget.trimLabel[i] = fr, ctr, lbl
+      trimKey = trimKey .. (fr and string.format("%.3f", fr) or "-") .. (ctr and "c" or "") .. tostring(lbl) .. "|"
+    end
+  end
+  key = key .. "|" .. trimKey
   if key ~= widget.lastKey then
     widget.lastKey = key
     lcd.invalidate()
@@ -455,6 +715,12 @@ end
 ------------------------------------------------------------------------
 -- Painting
 ------------------------------------------------------------------------
+-- Flight scale: a tick every 0.05 V/cell, labelled every 0.1 V (3.6-4.2).
+local FLIGHT_SCALE = { key = "flight", n = 12, major = 2,
+  label = function(f)
+    return string.format("%.1f", FLIGHT_TYPE.empty + f * (FLIGHT_TYPE.full - FLIGHT_TYPE.empty))
+  end }
+
 local function paintFlight(widget, L)
   local d = L.flight
   lcd.font(FONT_S)
@@ -466,28 +732,37 @@ local function paintFlight(widget, L)
     lcd.drawText(L.lx + L.lw, L.pad, "DEMO", RIGHT)
   end
 
-  local total, sub, color, cell
+  -- Percentage is the position on the 3.60-4.20 V/cell scale (a straight
+  -- line, not a true state of charge).
+  local pct, total, sub, color, cell
   if widget.volts then
     cell = widget.volts / widget.cells
     color = zoneColor(cell, FLIGHT_TYPE)
+    pct = string.format("%d%%", math.floor(cellFrac(cell, FLIGHT_TYPE) * 100 + 0.5))
     total = string.format("%.2fV", widget.volts)
     sub = string.format("%.2fV/cell  %dS", cell, widget.cells)
   else
     color = C_GREY
+    pct = "--%"
     total = "--.--V"
     sub = (widget.battSource or widget.demo) and "No telemetry" or "Set source"
   end
 
-  drawZoneDial(d, FLIGHT_TYPE, cell, color)
+  drawZoneDial(d, FLIGHT_TYPE, cell, FLIGHT_SCALE)
 
+  -- Big percentage, then pack volts, then volts per cell and cell count.
   lcd.color(color == C_RED and C_RED_TEXT or color)
-  local tw, th = fitFont(total, d.r1 * 1.5, d.r1 * 0.7)
-  local ty = d.cy - th * 0.65
-  drawCentered(d.cx, ty, total, tw)
+  local pw, ph = fitFont(pct, d.r1 * 1.0, d.r1 * 0.5)
+  local py = d.cy - ph * 0.8
+  drawCentered(d.cx, py, pct, pw)
+
+  lcd.color(widget.volts and C_TEXT or C_GREY)
+  local tw, th = fitFont(total, d.r1 * 1.0, d.r1 * 0.22)
+  drawCentered(d.cx, py + ph, total, tw)
 
   lcd.color(C_SUBTEXT)
-  local sw = fitFont(sub, d.r1 * 1.5, d.r1 * 0.35)
-  drawCentered(d.cx, ty + th, sub, sw)
+  local sw = fitFont(sub, d.r1 * 1.2, d.r1 * 0.18)
+  drawCentered(d.cx, py + ph + th + 2, sub, sw)
 end
 
 local function paintRates(widget, L)
@@ -531,45 +806,46 @@ local function paintTimer(widget, L)
     textColor = C_GREY
   end
 
-  drawDial(d, frac > 0 and 360 * frac or nil, color, nil, nil)
+  drawSweep(d, frac > 0 and frac or nil, nil, color)
 
   lcd.color(textColor)
   local tw, th = fitFont(text, d.r1 * 1.6, d.r1 * 0.75)
-  local ty = d.cy - th * 0.6
-  drawCentered(d.cx, ty, text, tw)
+  drawCentered(d.cx, d.cy - th / 2, text, tw)
 
+  -- Name underneath, like the engine light.
   lcd.font(FONT_S)
   lcd.color(C_SUBTEXT)
   local label = (widget.timerSource or widget.demo) and "TIMER" or "Set timer"
   local lw = lcd.getTextSize(label)
-  drawCentered(d.cx, ty + th, label, lw)
+  drawCentered(d.cx, L.circY + L.circR + 3, label, lw)
 end
 
+-- Engine light: green ARMED / red DISARMED / grey SET when no switch is set,
+-- the same size as the timer ring, with ENGINE underneath.
 local function paintEngine(widget, L)
-  local x, y, w, h = L.engX, L.pad, L.engW, L.rowH
-  local bg, state = C_GREY, "SET SWITCH"
+  local cx, cy, r = L.engCx, L.circY, L.circR
+  local bg, state = C_GREY, "SET"
   if widget.armed == true then
     bg, state = C_ARMED, "ARMED"
   elseif widget.armed == false then
     bg, state = C_DISARMED, "DISARMED"
   end
   lcd.color(bg)
-  lcd.drawFilledRectangle(x, y, w, h)
+  lcd.drawFilledCircle(cx, cy, r)
 
   lcd.color(C_TEXT)
-  local sw, sh = fitFont(state, w - 12, h * 0.4)
+  local sw, sh = fitFont(state, r * 1.6, r * 0.6)
+  drawCentered(cx, cy - sh / 2, state, sw)
+
   lcd.font(FONT_S)
-  local lw, lh = lcd.getTextSize("ENGINE")
-  local by = y + (h - (lh + 4 + sh)) / 2
-  drawCentered(x + w / 2, by, "ENGINE", lw)
-  fitFont(state, w - 12, h * 0.4)
-  drawCentered(x + w / 2, by + lh + 4, state, sw)
+  lcd.color(C_SUBTEXT)
+  local lw = lcd.getTextSize("ENGINE")
+  drawCentered(cx, cy + r + 3, "ENGINE", lw)
 end
 
 local function paintReceiver(widget, L)
   local d = L.rxDial
-  local bt = BATT_TYPES[widget.rxType] or BATT_TYPES[1]
-  local cells = math.max(1, widget.rxCells)
+  local bt = rxProfile(widget)
 
   lcd.font(FONT_S)
   lcd.color(C_SUBTEXT)
@@ -577,27 +853,28 @@ local function paintReceiver(widget, L)
 
   local cell, color, text, sub = nil, C_GREY, "--.-V", nil
   if widget.rxVolts then
-    cell = widget.rxVolts / cells
+    cell = widget.rxVolts
     color = zoneColor(cell, bt)
     text = string.format("%.1fV", widget.rxVolts)
-    sub = string.format("%dS %s  %.2fV/cell", cells, bt.name, cell)
+    sub = string.format("%.1f-%.1fV", bt.empty, bt.full)
   else
     sub = (widget.rxSource or widget.demo) and "No telemetry" or "Set source"
   end
   lcd.drawText(L.rx + L.rw, L.rxY, sub, RIGHT)
 
-  drawZoneDial(d, bt, cell, color)
+  drawZoneDial(d, bt, cell, rxScale(bt))
 
   lcd.color(color == C_RED and C_RED_TEXT or color)
-  local tw, th = fitFont(text, d.r1 * 1.3, d.r1 * 0.55)
+  local tw, th = fitFont(text, d.r1 * 1.0, d.r1 * 0.5)
   drawCentered(d.cx, d.cy - th, text, tw)
 end
 
 local function paint(widget)
   local w, h = lcd.getWindowSize()
   local L = widget.layout
-  if L == nil or L.w ~= w or L.h ~= h then
-    L = buildLayout(w, h)
+  local trims = widget.trimShow == 1
+  if L == nil or L.w ~= w or L.h ~= h or L.trims ~= trims then
+    L = buildLayout(w, h, trims)
     widget.layout = L
   end
 
@@ -606,7 +883,7 @@ local function paint(widget)
 
   -- Dividers
   lcd.color(C_TRACK)
-  lcd.drawFilledRectangle(L.split, L.pad, 1, h - 2 * L.pad)
+  lcd.drawFilledRectangle(L.split, L.pad, 1, L.ch - 2 * L.pad)
   lcd.drawFilledRectangle(L.lx, L.ratesY - math.floor(L.pad / 2) - 1, L.lw, 1)
   lcd.drawFilledRectangle(L.rx, L.rxDivY, L.rw, 1)
 
@@ -615,6 +892,7 @@ local function paint(widget)
   paintTimer(widget, L)
   paintEngine(widget, L)
   paintReceiver(widget, L)
+  paintTrims(widget, L)
 end
 
 ------------------------------------------------------------------------
@@ -625,12 +903,18 @@ for n = 1, MAX_CELLS do
   FLIGHT_CELL_CHOICES[#FLIGHT_CELL_CHOICES + 1] = { n .. "S", n }
 end
 
-local RX_TYPE_CHOICES = {}
-for i, bt in ipairs(BATT_TYPES) do RX_TYPE_CHOICES[i] = { bt.name, i } end
+local RX_PRESET_CHOICES = {}
+for i, p in ipairs(RX_PRESETS) do RX_PRESET_CHOICES[i] = { p.name .. " pack", i } end
 
-local RX_CELL_CHOICES = {
-  { "1S", 1 }, { "2S", 2 }, { "3S", 3 }, { "4S", 4 }, { "5S", 5 },
-}
+-- A volts setting shown with two decimals (the field works in hundredths).
+local function addVoltsField(label, get, set)
+  local line = form.addLine(label)
+  local f = form.addNumberField(line, nil, 300, 1500,
+    function() return math.floor((get() or 0) * 100 + 0.5) end,
+    function(v) set(v / 100); lcd.invalidate() end)
+  pcall(function() f:decimals(2) end)
+  pcall(function() f:suffix("V") end)
+end
 
 local function configure(widget)
   local line = form.addLine("Flight battery voltage")
@@ -648,15 +932,25 @@ local function configure(widget)
     function() return widget.rxSource end,
     function(v) widget.rxSource = v end)
 
-  line = form.addLine("Receiver battery type")
-  form.addChoiceField(line, nil, RX_TYPE_CHOICES,
-    function() return widget.rxType end,
-    function(v) widget.rxType = v; lcd.invalidate() end)
+  line = form.addLine("Receiver pack")
+  form.addChoiceField(line, nil, RX_PRESET_CHOICES,
+    function() return widget.rxPreset end,
+    function(v)
+      local p = RX_PRESETS[v] or RX_PRESETS[RX_DEFAULT_PRESET]
+      widget.rxPreset = v
+      widget.rxEmpty, widget.rxYellow, widget.rxGreen, widget.rxFull =
+        p.empty, p.yellow, p.green, p.full
+      lcd.invalidate()
+    end)
 
-  line = form.addLine("Receiver cells")
-  form.addChoiceField(line, nil, RX_CELL_CHOICES,
-    function() return widget.rxCells end,
-    function(v) widget.rxCells = v; lcd.invalidate() end)
+  addVoltsField("Receiver dial start",
+    function() return widget.rxEmpty end, function(v) widget.rxEmpty = v end)
+  addVoltsField("Receiver yellow from",
+    function() return widget.rxYellow end, function(v) widget.rxYellow = v end)
+  addVoltsField("Receiver green from",
+    function() return widget.rxGreen end, function(v) widget.rxGreen = v end)
+  addVoltsField("Receiver dial end",
+    function() return widget.rxFull end, function(v) widget.rxFull = v end)
 
   line = form.addLine("Timer")
   form.addSourceField(line, nil,
@@ -674,6 +968,18 @@ local function configure(widget)
     form.addSwitchField(line, nil,
       function() return widget.rateSwitches[i] end,
       function(v) widget.rateSwitches[i] = v end)
+  end
+
+  line = form.addLine("Trim bars")
+  form.addChoiceField(line, nil, { { "Show", 1 }, { "Hide", 0 } },
+    function() return widget.trimShow end,
+    function(v) widget.trimShow = v; lcd.invalidate() end)
+
+  for i = 1, 4 do
+    line = form.addLine(TRIM_NAMES[i] .. " trim")
+    form.addSourceField(line, nil,
+      function() return widget.trimSources[i] end,
+      function(v) widget.trimSources[i] = v; lcd.invalidate() end)
   end
 
   line = form.addLine("Demo source (testing)")
@@ -698,8 +1004,8 @@ local function read(widget)
   widget.battSource  = asSource(storage.read("battSrc"))
   widget.battCells   = asInt(storage.read("battCells"), 0, 0, MAX_CELLS)
   widget.rxSource    = asSource(storage.read("rxSrc"))
-  widget.rxType      = asInt(storage.read("rxType"), 1, 1, #BATT_TYPES)
-  widget.rxCells     = asInt(storage.read("rxCells"), 2, 1, 12)
+  storage.read("rxType")    -- old slots, no longer used; still read so the
+  storage.read("rxCells")   -- settings after them stay in line
   widget.timerSource = asSource(storage.read("timerSrc"))
   widget.armSwitch   = asSource(storage.read("armSw"))
   widget.rateSwitches = {
@@ -708,20 +1014,47 @@ local function read(widget)
     asSource(storage.read("rateHigh")),
   }
   widget.demoSource  = asSource(storage.read("demo"))
+  widget.trimShow    = asInt(storage.read("trims"), 1, 0, 1)
+  -- Unset trims fall back to the ones found automatically.
+  local auto = findTrims()
+  widget.trimSources = {}
+  for i, k in ipairs(TRIM_KEYS) do
+    widget.trimSources[i] = asSource(storage.read("trim_" .. k)) or auto[i]
+  end
+  widget.rxPreset = asInt(storage.read("rxPreset"), RX_DEFAULT_PRESET, 1, #RX_PRESETS)
+  local p = RX_PRESETS[widget.rxPreset]
+  local function volts(key, def)
+    local v = asInt(storage.read(key), nil, 100, 2000)
+    return v and v / 100 or def
+  end
+  widget.rxEmpty  = volts("rxEmpty",  p.empty)
+  widget.rxYellow = volts("rxYellow", p.yellow)
+  widget.rxGreen  = volts("rxGreen",  p.green)
+  widget.rxFull   = volts("rxFull",   p.full)
 end
 
 local function write(widget)
   storage.write("battSrc", widget.battSource)
   storage.write("battCells", widget.battCells)
   storage.write("rxSrc", widget.rxSource)
-  storage.write("rxType", widget.rxType)
-  storage.write("rxCells", widget.rxCells)
+  storage.write("rxType", 0)    -- unused slots, kept so the settings
+  storage.write("rxCells", 0)   -- after them stay in line
   storage.write("timerSrc", widget.timerSource)
   storage.write("armSw", widget.armSwitch)
   storage.write("rateLow", widget.rateSwitches[1])
   storage.write("rateMed", widget.rateSwitches[2])
   storage.write("rateHigh", widget.rateSwitches[3])
   storage.write("demo", widget.demoSource)
+  storage.write("trims", widget.trimShow)
+  for i, k in ipairs(TRIM_KEYS) do
+    storage.write("trim_" .. k, widget.trimSources[i])
+  end
+  storage.write("rxPreset", widget.rxPreset)
+  local function cv(v) return math.floor(v * 100 + 0.5) end
+  storage.write("rxEmpty",  cv(widget.rxEmpty))
+  storage.write("rxYellow", cv(widget.rxYellow))
+  storage.write("rxGreen",  cv(widget.rxGreen))
+  storage.write("rxFull",   cv(widget.rxFull))
 end
 
 local function init()
